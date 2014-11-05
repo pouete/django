@@ -1,5 +1,6 @@
 from __future__ import unicode_literals
 
+from collections import Counter
 from copy import copy
 import difflib
 import errno
@@ -160,6 +161,24 @@ class SimpleTestCase(unittest.TestCase):
     _overridden_settings = None
     _modified_settings = None
 
+    @classmethod
+    def setUpClass(cls):
+        if cls._overridden_settings:
+            cls._cls_overridden_context = override_settings(**cls._overridden_settings)
+            cls._cls_overridden_context.enable()
+        if cls._modified_settings:
+            cls._cls_modified_context = modify_settings(cls._modified_settings)
+            cls._cls_modified_context.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, '_cls_modified_context'):
+            cls._cls_modified_context.disable()
+            delattr(cls, '_cls_modified_context')
+        if hasattr(cls, '_cls_overridden_context'):
+            cls._cls_overridden_context.disable()
+            delattr(cls, '_cls_overridden_context')
+
     def __call__(self, result=None):
         """
         Wrapper around default __call__ method to perform common Django test
@@ -191,24 +210,18 @@ class SimpleTestCase(unittest.TestCase):
         * If the class has a 'urls' attribute, replace ROOT_URLCONF with it.
         * Clearing the mail test outbox.
         """
-        if self._overridden_settings:
-            self._overridden_context = override_settings(**self._overridden_settings)
-            self._overridden_context.enable()
-        if self._modified_settings:
-            self._modified_context = modify_settings(self._modified_settings)
-            self._modified_context.enable()
         self.client = self.client_class()
         self._urlconf_setup()
         mail.outbox = []
 
     def _urlconf_setup(self):
-        set_urlconf(None)
         if hasattr(self, 'urls'):
             warnings.warn(
                 "SimpleTestCase.urls is deprecated and will be removed in "
                 "Django 2.0. Use @override_settings(ROOT_URLCONF=...) "
                 "in %s instead." % self.__class__.__name__,
                 RemovedInDjango20Warning, stacklevel=2)
+            set_urlconf(None)
             self._old_root_urlconf = settings.ROOT_URLCONF
             settings.ROOT_URLCONF = self.urls
             clear_url_caches()
@@ -219,21 +232,16 @@ class SimpleTestCase(unittest.TestCase):
         * Putting back the original ROOT_URLCONF if it was changed.
         """
         self._urlconf_teardown()
-        if self._modified_settings:
-            self._modified_context.disable()
-        if self._overridden_settings:
-            self._overridden_context.disable()
 
     def _urlconf_teardown(self):
-        set_urlconf(None)
         if hasattr(self, '_old_root_urlconf'):
+            set_urlconf(None)
             settings.ROOT_URLCONF = self._old_root_urlconf
             clear_url_caches()
 
     def settings(self, **kwargs):
         """
-        A context manager that temporarily sets a setting and reverts
-        back to the original value when exiting the context.
+        A context manager that temporarily sets a setting and reverts to the original value when exiting the context.
         """
         return override_settings(**kwargs)
 
@@ -328,8 +336,8 @@ class SimpleTestCase(unittest.TestCase):
         else:
             content = response.content
         if not isinstance(text, bytes) or html:
-            text = force_text(text, encoding=response._charset)
-            content = content.decode(response._charset)
+            text = force_text(text, encoding=response.charset)
+            content = content.decode(response.charset)
             text_repr = "'%s'" % text
         else:
             text_repr = repr(text)
@@ -510,6 +518,12 @@ class SimpleTestCase(unittest.TestCase):
         if msg_prefix:
             msg_prefix += ": "
 
+        if template_name is not None and response is not None and not hasattr(response, 'templates'):
+            raise ValueError(
+                "assertTemplateUsed() and assertTemplateNotUsed() are only "
+                "usable on responses fetched using the Django test Client."
+            )
+
         if not hasattr(response, 'templates') or (response is None and template_name):
             if response:
                 template_name = response
@@ -521,7 +535,7 @@ class SimpleTestCase(unittest.TestCase):
                           None]
         return None, template_names, msg_prefix
 
-    def assertTemplateUsed(self, response=None, template_name=None, msg_prefix=''):
+    def assertTemplateUsed(self, response=None, template_name=None, msg_prefix='', count=None):
         """
         Asserts that the template with the provided name was used in rendering
         the response. Also usable as context manager.
@@ -539,6 +553,12 @@ class SimpleTestCase(unittest.TestCase):
             msg_prefix + "Template '%s' was not a template used to render"
             " the response. Actual template(s) used: %s" %
                 (template_name, ', '.join(template_names)))
+
+        if count is not None:
+            self.assertEqual(template_names.count(template_name), count,
+                msg_prefix + "Template '%s' was expected to be rendered %d "
+                "time(s) but was actually rendered %d time(s)." %
+                    (template_name, count, template_names.count(template_name)))
 
     def assertTemplateNotUsed(self, response=None, template_name=None, msg_prefix=''):
         """
@@ -620,8 +640,8 @@ class SimpleTestCase(unittest.TestCase):
         # test that max_length and min_length are always accepted
         if issubclass(fieldclass, CharField):
             field_kwargs.update({'min_length': 2, 'max_length': 20})
-            self.assertTrue(isinstance(fieldclass(*field_args, **field_kwargs),
-                                       fieldclass))
+            self.assertIsInstance(fieldclass(*field_args, **field_kwargs),
+                                  fieldclass)
 
     def assertHTMLEqual(self, html1, html2, msg=None):
         """
@@ -670,6 +690,11 @@ class SimpleTestCase(unittest.TestCase):
                 msg_prefix + "Couldn't find '%s' in response" % needle)
 
     def assertJSONEqual(self, raw, expected_data, msg=None):
+        """
+        Asserts that the JSON fragments raw and expected_data are equal.
+        Usual JSON non-significant whitespace rules apply as the heavyweight
+        is delegated to the json library.
+        """
         try:
             data = json.loads(raw)
         except ValueError:
@@ -680,6 +705,23 @@ class SimpleTestCase(unittest.TestCase):
             except ValueError:
                 self.fail("Second argument is not valid JSON: %r" % expected_data)
         self.assertEqual(data, expected_data, msg=msg)
+
+    def assertJSONNotEqual(self, raw, expected_data, msg=None):
+        """
+        Asserts that the JSON fragments raw and expected_data are not equal.
+        Usual JSON non-significant whitespace rules apply as the heavyweight
+        is delegated to the json library.
+        """
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            self.fail("First argument is not valid JSON: %r" % raw)
+        if isinstance(expected_data, six.string_types):
+            try:
+                expected_data = json.loads(expected_data)
+            except ValueError:
+                self.fail("Second argument is not valid JSON: %r" % expected_data)
+        self.assertNotEqual(data, expected_data, msg=msg)
 
     def assertXMLEqual(self, xml1, xml2, msg=None):
         """
@@ -725,6 +767,12 @@ class TransactionTestCase(SimpleTestCase):
 
     # Subclasses can define fixtures which will be automatically installed.
     fixtures = None
+
+    # If transactions aren't available, Django will serialize the database
+    # contents into a fixture during setup and flush and reload them
+    # during teardown (as flush does not restore data from migrations).
+    # This can be slow; this flag allows enabling on a per-case basis.
+    serialized_rollback = False
 
     def _pre_setup(self):
         """Performs any pre-test setup. This includes:
@@ -781,11 +829,22 @@ class TransactionTestCase(SimpleTestCase):
             if self.reset_sequences:
                 self._reset_sequences(db_name)
 
+            # If we need to provide replica initial data from migrated apps,
+            # then do so.
+            if self.serialized_rollback and hasattr(connections[db_name], "_test_serialized_contents"):
+                if self.available_apps is not None:
+                    apps.unset_available_apps()
+                connections[db_name].creation.deserialize_db_from_string(
+                    connections[db_name]._test_serialized_contents
+                )
+                if self.available_apps is not None:
+                    apps.set_available_apps(self.available_apps)
+
             if self.fixtures:
                 # We have to use this slightly awkward syntax due to the fact
                 # that we're using *args and **kwargs together.
                 call_command('loaddata', *self.fixtures,
-                             **{'verbosity': 0, 'database': db_name, 'skip_checks': True})
+                             **{'verbosity': 0, 'database': db_name})
 
     def _post_teardown(self):
         """Performs any post-test things. This includes:
@@ -817,16 +876,16 @@ class TransactionTestCase(SimpleTestCase):
         # Allow TRUNCATE ... CASCADE and don't emit the post_migrate signal
         # when flushing only a subset of the apps
         for db_name in self._databases_names(include_mirrors=False):
+            # Flush the database
             call_command('flush', verbosity=0, interactive=False,
-                         database=db_name, skip_checks=True,
-                         reset_sequences=False,
+                         database=db_name, reset_sequences=False,
                          allow_cascade=self.available_apps is not None,
                          inhibit_post_migrate=self.available_apps is not None)
 
     def assertQuerysetEqual(self, qs, values, transform=repr, ordered=True, msg=None):
         items = six.moves.map(transform, qs)
         if not ordered:
-            return self.assertEqual(set(items), set(values), msg=msg)
+            return self.assertEqual(Counter(items), Counter(values), msg=msg)
         values = list(values)
         # For example qs.iterator() could be passed as qs, but it does not
         # have 'ordered' attribute.
@@ -885,7 +944,6 @@ class TestCase(TransactionTestCase):
                                      'verbosity': 0,
                                      'commit': False,
                                      'database': db_name,
-                                     'skip_checks': True,
                                  })
                 except Exception:
                     self._fixture_teardown()
@@ -931,20 +989,24 @@ def _deferredSkip(condition, reason):
     return decorator
 
 
-def skipIfDBFeature(feature):
+def skipIfDBFeature(*features):
     """
-    Skip a test if a database has the named feature
+    Skip a test if a database has at least one of the named features.
     """
-    return _deferredSkip(lambda: getattr(connection.features, feature),
-                         "Database has feature %s" % feature)
+    return _deferredSkip(
+        lambda: any(getattr(connection.features, feature, False) for feature in features),
+        "Database has feature(s) %s" % ", ".join(features)
+    )
 
 
-def skipUnlessDBFeature(feature):
+def skipUnlessDBFeature(*features):
     """
-    Skip a test unless a database has the named feature
+    Skip a test unless a database has all the named features.
     """
-    return _deferredSkip(lambda: not getattr(connection.features, feature),
-                         "Database doesn't support feature %s" % feature)
+    return _deferredSkip(
+        lambda: not all(getattr(connection.features, feature, False) for feature in features),
+        "Database doesn't support feature(s): %s" % ", ".join(features)
+    )
 
 
 class QuietWSGIRequestHandler(WSGIRequestHandler):
@@ -1121,6 +1183,7 @@ class LiveServerTestCase(TransactionTestCase):
 
     @classmethod
     def setUpClass(cls):
+        super(LiveServerTestCase, cls).setUpClass()
         connections_override = {}
         for conn in connections.all():
             # If using in-memory sqlite databases, pass the connections to

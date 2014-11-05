@@ -6,6 +6,7 @@ and database field objects.
 from __future__ import unicode_literals
 
 from collections import OrderedDict
+import warnings
 
 from django.core.exceptions import (
     ImproperlyConfigured, ValidationError, NON_FIELD_ERRORS, FieldError)
@@ -16,6 +17,7 @@ from django.forms.utils import ErrorList
 from django.forms.widgets import (SelectMultiple, HiddenInput,
     MultipleHiddenInput)
 from django.utils import six
+from django.utils.deprecation import RemovedInDjango19Warning
 from django.utils.encoding import smart_text, force_text
 from django.utils.text import get_text_list, capfirst
 from django.utils.translation import ugettext_lazy as _, ugettext
@@ -401,10 +403,12 @@ class BaseModelForm(BaseForm):
 
     def _post_clean(self):
         opts = self._meta
-        # Update the model instance with self.cleaned_data.
-        self.instance = construct_instance(self, self.instance, opts.fields, opts.exclude)
 
         exclude = self._get_validation_exclusions()
+        # a subset of `exclude` which won't have the InlineForeignKeyField
+        # if we're adding a new object since that value doesn't exist
+        # until after the new instance is saved to the database.
+        construct_instance_exclude = list(exclude)
 
         # Foreign Keys being used to represent inline relationships
         # are excluded from basic field value validation. This is for two
@@ -415,7 +419,12 @@ class BaseModelForm(BaseForm):
         # so this can't be part of _get_validation_exclusions().
         for name, field in self.fields.items():
             if isinstance(field, InlineForeignKeyField):
+                if self.cleaned_data.get(name) is not None and self.cleaned_data[name]._state.adding:
+                    construct_instance_exclude.append(name)
                 exclude.append(name)
+
+        # Update the model instance with self.cleaned_data.
+        self.instance = construct_instance(self, self.instance, opts.fields, construct_instance_exclude)
 
         try:
             self.instance.full_clean(exclude=exclude, validate_unique=False)
@@ -805,7 +814,8 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
                          formset=BaseModelFormSet, extra=1, can_delete=False,
                          can_order=False, max_num=None, fields=None, exclude=None,
                          widgets=None, validate_max=False, localized_fields=None,
-                         labels=None, help_texts=None, error_messages=None):
+                         labels=None, help_texts=None, error_messages=None,
+                         min_num=None, validate_min=False):
     """
     Returns a FormSet class for the given Django model class.
     """
@@ -823,9 +833,9 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
                              formfield_callback=formfield_callback,
                              widgets=widgets, localized_fields=localized_fields,
                              labels=labels, help_texts=help_texts, error_messages=error_messages)
-    FormSet = formset_factory(form, formset, extra=extra, max_num=max_num,
+    FormSet = formset_factory(form, formset, extra=extra, min_num=min_num, max_num=max_num,
                               can_order=can_order, can_delete=can_delete,
-                              validate_max=validate_max)
+                              validate_min=validate_min, validate_max=validate_max)
     FormSet.model = model
     return FormSet
 
@@ -866,7 +876,11 @@ class BaseInlineFormSet(BaseModelFormSet):
             form.data[form.add_prefix(self.fk.name)] = None
 
         # Set the fk value here so that the form can do its validation.
-        setattr(form.instance, self.fk.get_attname(), self.instance.pk)
+        fk_value = self.instance.pk
+        if self.fk.rel.field_name != self.fk.rel.to._meta.pk.name:
+            fk_value = getattr(self.instance, self.fk.rel.field_name)
+            fk_value = getattr(fk_value, 'pk', fk_value)
+        setattr(form.instance, self.fk.get_attname(), fk_value)
         return form
 
     @classmethod
@@ -920,7 +934,7 @@ def _get_foreign_key(parent_model, model, fk_name=None, can_fail=False):
     """
     Finds and returns the ForeignKey from model to parent if there is one
     (returns None if can_fail is True and no such field exists). If fk_name is
-    provided, assume it is the name of the ForeignKey field. Unles can_fail is
+    provided, assume it is the name of the ForeignKey field. Unless can_fail is
     True, an exception is raised if there is no ForeignKey from model to
     parent_model.
     """
@@ -935,7 +949,7 @@ def _get_foreign_key(parent_model, model, fk_name=None, can_fail=False):
                     (fk.rel.to != parent_model and
                      fk.rel.to not in parent_model._meta.get_parent_list()):
                 raise ValueError(
-                    "fk_name '%s' is not a ForeignKey to '%s.%'."
+                    "fk_name '%s' is not a ForeignKey to '%s.%s'."
                     % (fk_name, parent_model._meta.app_label, parent_model._meta.object_name))
         elif len(fks_to_parent) == 0:
             raise ValueError(
@@ -955,12 +969,22 @@ def _get_foreign_key(parent_model, model, fk_name=None, can_fail=False):
             if can_fail:
                 return
             raise ValueError(
-                "'%s.%s' has no ForeignKey to '%s.%s'."
-                % (model._meta.app_label, model._meta.object_name, parent_model._meta.app_label, parent_model._meta.object_name))
+                "'%s.%s' has no ForeignKey to '%s.%s'." % (
+                    model._meta.app_label,
+                    model._meta.object_name,
+                    parent_model._meta.app_label,
+                    parent_model._meta.object_name,
+                )
+            )
         else:
             raise ValueError(
-                "'%s.%s' has more than one ForeignKey to '%s.%s'."
-                % (model._meta.app_label, model._meta.object_name, parent_model._meta.app_label, parent_model._meta.object_name))
+                "'%s.%s' has more than one ForeignKey to '%s.%s'." % (
+                    model._meta.app_label,
+                    model._meta.object_name,
+                    parent_model._meta.app_label,
+                    parent_model._meta.object_name,
+                )
+            )
     return fk
 
 
@@ -969,7 +993,8 @@ def inlineformset_factory(parent_model, model, form=ModelForm,
                           fields=None, exclude=None, extra=3, can_order=False,
                           can_delete=True, max_num=None, formfield_callback=None,
                           widgets=None, validate_max=False, localized_fields=None,
-                          labels=None, help_texts=None, error_messages=None):
+                          labels=None, help_texts=None, error_messages=None,
+                          min_num=None, validate_min=False):
     """
     Returns an ``InlineFormSet`` for the given kwargs.
 
@@ -989,8 +1014,10 @@ def inlineformset_factory(parent_model, model, form=ModelForm,
         'can_order': can_order,
         'fields': fields,
         'exclude': exclude,
+        'min_num': min_num,
         'max_num': max_num,
         'widgets': widgets,
+        'validate_min': validate_min,
         'validate_max': validate_max,
         'localized_fields': localized_fields,
         'labels': labels,
@@ -1041,7 +1068,7 @@ class InlineForeignKeyField(Field):
             raise ValidationError(self.error_messages['invalid_choice'], code='invalid_choice')
         return self.parent_instance
 
-    def _has_changed(self, initial, data):
+    def has_changed(self, initial, data):
         return False
 
 
@@ -1056,12 +1083,12 @@ class ModelChoiceIterator(object):
         if self.field.cache_choices:
             if self.field.choice_cache is None:
                 self.field.choice_cache = [
-                    self.choice(obj) for obj in self.queryset.all()
+                    self.choice(obj) for obj in self.queryset.iterator()
                 ]
             for choice in self.field.choice_cache:
                 yield choice
         else:
-            for obj in self.queryset.all():
+            for obj in self.queryset.iterator():
                 yield self.choice(obj)
 
     def __len__(self):
@@ -1081,7 +1108,7 @@ class ModelChoiceField(ChoiceField):
                             ' the available choices.'),
     }
 
-    def __init__(self, queryset, empty_label="---------", cache_choices=False,
+    def __init__(self, queryset, empty_label="---------", cache_choices=None,
                  required=True, widget=None, label=None, initial=None,
                  help_text='', to_field_name=None, limit_choices_to=None,
                  *args, **kwargs):
@@ -1089,6 +1116,12 @@ class ModelChoiceField(ChoiceField):
             self.empty_label = None
         else:
             self.empty_label = empty_label
+        if cache_choices is not None:
+            warnings.warn("cache_choices has been deprecated and will be "
+                "removed in Django 1.9.",
+                RemovedInDjango19Warning, stacklevel=2)
+        else:
+            cache_choices = False
         self.cache_choices = cache_choices
 
         # Call Field instead of ChoiceField __init__() because we don't need
@@ -1156,14 +1189,14 @@ class ModelChoiceField(ChoiceField):
         try:
             key = self.to_field_name or 'pk'
             value = self.queryset.get(**{key: value})
-        except (ValueError, self.queryset.model.DoesNotExist):
+        except (ValueError, TypeError, self.queryset.model.DoesNotExist):
             raise ValidationError(self.error_messages['invalid_choice'], code='invalid_choice')
         return value
 
     def validate(self, value):
         return Field.validate(self, value)
 
-    def _has_changed(self, initial, data):
+    def has_changed(self, initial, data):
         initial_value = initial if initial is not None else ''
         data_value = data if data is not None else ''
         return force_text(self.prepare_value(initial_value)) != force_text(data_value)
@@ -1180,7 +1213,7 @@ class ModelMultipleChoiceField(ModelChoiceField):
         'invalid_pk_value': _('"%(pk)s" is not a valid value for a primary key.')
     }
 
-    def __init__(self, queryset, cache_choices=False, required=True,
+    def __init__(self, queryset, cache_choices=None, required=True,
                  widget=None, label=None, initial=None,
                  help_text='', *args, **kwargs):
         super(ModelMultipleChoiceField, self).__init__(queryset, None,
@@ -1204,7 +1237,7 @@ class ModelMultipleChoiceField(ModelChoiceField):
         for pk in value:
             try:
                 self.queryset.filter(**{key: pk})
-            except ValueError:
+            except (ValueError, TypeError):
                 raise ValidationError(
                     self.error_messages['invalid_pk_value'],
                     code='invalid_pk_value',
@@ -1231,7 +1264,7 @@ class ModelMultipleChoiceField(ModelChoiceField):
             return [super(ModelMultipleChoiceField, self).prepare_value(v) for v in value]
         return super(ModelMultipleChoiceField, self).prepare_value(value)
 
-    def _has_changed(self, initial, data):
+    def has_changed(self, initial, data):
         if initial is None:
             initial = []
         if data is None:

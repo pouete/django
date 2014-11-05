@@ -77,7 +77,8 @@ class SelectForUpdateTests(TransactionTestCase):
         Test that the backend's FOR UPDATE variant appears in
         generated SQL when select_for_update is invoked.
         """
-        list(Person.objects.all().select_for_update())
+        with transaction.atomic():
+            list(Person.objects.all().select_for_update())
         self.assertTrue(self.has_for_update_sql(connection))
 
     @skipUnlessDBFeature('has_select_for_update_nowait')
@@ -86,7 +87,8 @@ class SelectForUpdateTests(TransactionTestCase):
         Test that the backend's FOR UPDATE NOWAIT variant appears in
         generated SQL when select_for_update is invoked.
         """
-        list(Person.objects.all().select_for_update(nowait=True))
+        with transaction.atomic():
+            list(Person.objects.all().select_for_update(nowait=True))
         self.assertTrue(self.has_for_update_sql(connection, nowait=True))
 
     @requires_threading
@@ -124,6 +126,26 @@ class SelectForUpdateTests(TransactionTestCase):
             list,
             Person.objects.all().select_for_update(nowait=True)
         )
+
+    @skipUnlessDBFeature('has_select_for_update')
+    def test_for_update_requires_transaction(self):
+        """
+        Test that a TransactionManagementError is raised
+        when a select_for_update query is executed outside of a transaction.
+        """
+        with self.assertRaises(transaction.TransactionManagementError):
+            list(Person.objects.all().select_for_update())
+
+    @skipUnlessDBFeature('has_select_for_update')
+    def test_for_update_requires_transaction_only_in_execution(self):
+        """
+        Test that no TransactionManagementError is raised
+        when select_for_update is invoked outside of a transaction -
+        only when the query is executed.
+        """
+        people = Person.objects.all().select_for_update()
+        with self.assertRaises(transaction.TransactionManagementError):
+            list(people)
 
     def run_select_for_update(self, status, nowait=False):
         """
@@ -243,3 +265,9 @@ class SelectForUpdateTests(TransactionTestCase):
             self.assertEqual(router.db_for_write(Person), query.db)
         finally:
             router.routers = old_routers
+
+    @skipUnlessDBFeature('has_select_for_update')
+    def test_select_for_update_with_get(self):
+        with transaction.atomic():
+            person = Person.objects.select_for_update().get(name='Reinhardt')
+        self.assertEqual(person.name, 'Reinhardt')

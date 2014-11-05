@@ -9,8 +9,8 @@ import time
 from unittest import skipIf, skipUnless
 
 from django.db import (connection, transaction,
-    DatabaseError, IntegrityError, OperationalError)
-from django.test import TransactionTestCase, skipIfDBFeature
+    DatabaseError, Error, IntegrityError, OperationalError)
+from django.test import TransactionTestCase, skipIfDBFeature, skipUnlessDBFeature
 from django.utils import six
 
 from .models import Reporter
@@ -338,6 +338,20 @@ class AtomicErrorsTests(TransactionTestCase):
             r2.save(force_update=True)
         self.assertEqual(Reporter.objects.get(pk=r1.pk).last_name, "Calculus")
 
+    @skipUnlessDBFeature('test_db_allows_multiple_connections')
+    def test_atomic_prevents_queries_in_broken_transaction_after_client_close(self):
+        with transaction.atomic():
+            Reporter.objects.create(first_name="Archibald", last_name="Haddock")
+            connection.close()
+            # The connection is closed and the transaction is marked as
+            # needing rollback. This will raise an InterfaceError on databases
+            # that refuse to create cursors on closed connections (PostgreSQL)
+            # and a TransactionManagementError on other databases.
+            with self.assertRaises(Error):
+                Reporter.objects.create(first_name="Cuthbert", last_name="Calculus")
+        # The connection is usable again .
+        self.assertEqual(Reporter.objects.count(), 0)
+
 
 @skipUnless(connection.vendor == 'mysql', "MySQL-specific behaviors")
 class AtomicMySQLTests(TransactionTestCase):
@@ -389,3 +403,25 @@ class AtomicMiscTests(TransactionTestCase):
                 pass
         # Must not raise an exception
         transaction.atomic(Callable())
+
+    @skipUnlessDBFeature('can_release_savepoints')
+    def test_atomic_does_not_leak_savepoints_on_failure(self):
+        # Regression test for #23074
+
+        # Expect an error when rolling back a savepoint that doesn't exist.
+        # Done outside of the transaction block to ensure proper recovery.
+        with self.assertRaises(Error):
+
+            # Start a plain transaction.
+            with transaction.atomic():
+
+                # Swallow the intentional error raised in the sub-transaction.
+                with six.assertRaisesRegex(self, Exception, "Oops"):
+
+                    # Start a sub-transaction with a savepoint.
+                    with transaction.atomic():
+                        sid = connection.savepoint_ids[-1]
+                        raise Exception("Oops")
+
+                # This is expected to fail because the savepoint no longer exists.
+                connection.savepoint_rollback(sid)

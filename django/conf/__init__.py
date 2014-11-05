@@ -90,15 +90,9 @@ class Settings(BaseSettings):
         # store the settings module in case someone later cares
         self.SETTINGS_MODULE = settings_module
 
-        try:
-            mod = importlib.import_module(self.SETTINGS_MODULE)
-        except ImportError as e:
-            raise ImportError(
-                "Could not import settings '%s' (Is it on sys.path? Is there an import error in the settings file?): %s"
-                % (self.SETTINGS_MODULE, e)
-            )
+        mod = importlib.import_module(self.SETTINGS_MODULE)
 
-        tuple_settings = ("INSTALLED_APPS", "TEMPLATE_DIRS")
+        tuple_settings = ("INSTALLED_APPS", "TEMPLATE_DIRS", "LOCALE_PATHS")
         self._explicit_settings = set()
         for setting in dir(mod):
             if setting.isupper():
@@ -153,11 +147,12 @@ class UserSettingsHolder(BaseSettings):
 
     def __setattr__(self, name, value):
         self._deleted.discard(name)
-        return super(UserSettingsHolder, self).__setattr__(name, value)
+        super(UserSettingsHolder, self).__setattr__(name, value)
 
     def __delattr__(self, name):
         self._deleted.add(name)
-        return super(UserSettingsHolder, self).__delattr__(name)
+        if hasattr(self, name):
+            super(UserSettingsHolder, self).__delattr__(name)
 
     def __dir__(self):
         return list(self.__dict__) + dir(self.default_settings)
